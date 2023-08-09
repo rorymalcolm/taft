@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+node dist/index.js start --cluster '[{ "node": 1, "port": 3000 }, { "node": 2, "port": 3001 }]' --node 1 --port 3000 & node dist/index.js start --cluster '[{ "node": 1, "port": 3000 }, { "node": 2, "port": 3001 }]' --node 2 --port 3001
