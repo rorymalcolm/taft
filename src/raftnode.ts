@@ -1,28 +1,11 @@
 import http from "http";
 import axios from "axios";
-
-type LogEntry = {
-  term: number;
-  command: string;
-};
-
-type AppendEntriesRequest = {
-  term: number;
-  leaderId: number;
-  prevLogIndex: number;
-  prevLogTerm: number;
-  entries: LogEntry[];
-  leaderCommit: number;
-};
-
-type RequestVoteRequest = {
-  term: number;
-  candidateId: number;
-  lastLogIndex: number;
-  lastLogTerm: number;
-};
-
-type RaftNodeState = "follower" | "candidate" | "leader";
+import {
+  RequestVoteRequest,
+  AppendEntriesRequest,
+  RaftNodeState,
+  LogEntry,
+} from "./types";
 
 function randomElectionTimeOut() {
   return Math.floor(Math.random() * 150) + 150;
@@ -45,13 +28,6 @@ async function sendAppendEntriesRequest(
     request
   );
   return await req.data;
-}
-
-function heartBeat(node: RaftNode) {
-  console.log(`Node ${node.getNodeId()} is ${node.getState()}`);
-  setTimeout(() => {
-    heartBeat(node);
-  }, 50);
 }
 
 async function readBody(request: http.IncomingMessage): Promise<string> {
@@ -104,7 +80,6 @@ export default class RaftNode {
     this.port = port;
     this.clusterTopology = cluster;
     console.log(`Cluster topology: ${JSON.stringify(cluster)}`);
-    heartBeat(this);
   }
 
   getNodeId() {
@@ -167,6 +142,7 @@ export default class RaftNode {
           voteCount++;
           if (voteCount >= quorum) {
             this.state = "leader";
+            console.log(`Node ${this.nodeId} is now the leader`);
             this.nextIndex = [];
             this.matchIndex = [];
             for (let i = 0; i < this.clusterTopology.length; i++) {
@@ -194,7 +170,7 @@ export default class RaftNode {
     if (!node) {
       return;
     }
-    const appendEntriesResponse = await sendAppendEntriesRequest(node.port, {
+    await sendAppendEntriesRequest(node.port, {
       term: this.currentTerm,
       leaderId: this.nodeId,
       prevLogIndex: this.nextIndex[nodeId],
