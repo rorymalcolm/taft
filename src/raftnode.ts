@@ -7,8 +7,12 @@ import {
   LogEntry,
 } from "./types";
 
+const ELECTION_TIMEOUT_MIN = 150;
+
 function randomElectionTimeOut() {
-  return Math.floor(Math.random() * 150) + 150;
+  return (
+    Math.floor(Math.random() * ELECTION_TIMEOUT_MIN) + ELECTION_TIMEOUT_MIN
+  );
 }
 
 async function sendRequestVoteRequest(
@@ -128,9 +132,9 @@ export default class RaftNode {
           lastLogTerm: this.log[this.log.length - 1]?.term || 0,
         });
         console.log(
-          `Got vote response from Node ${node.node} on port ${
-            node.port
-          }: ${JSON.stringify(voteRequestResponse)}`
+          `Node ${this.nodeId} got vote response from Node ${
+            node.node
+          } on port ${node.port}: ${JSON.stringify(voteRequestResponse)}`
         );
         if (voteRequestResponse.term > this.currentTerm) {
           this.currentTerm = voteRequestResponse.term;
