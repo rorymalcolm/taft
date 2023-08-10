@@ -136,14 +136,11 @@ export default class RaftNode {
     this.currentTerm++;
     this.votedFor = null;
     this.lastHeartbeat = Date.now();
-    const quorum =
-      this.clusterTopology.length <= 2
-        ? 1
-        : Math.floor(this.clusterTopology.length / 2) + 1;
+    const quorum = Math.floor(this.clusterTopology.length / 2) + 1;
     console.log(
       `Node ${this.nodeId} is now a candidate and needs ${quorum} votes to become leader`
     );
-    let voteCount = 0;
+    let voteCount = 1; // we always vote for ourselves
     for (const node of this.clusterTopology) {
       if (node.node !== this.nodeId && this.state === "candidate") {
         console.log(
@@ -298,8 +295,8 @@ export default class RaftNode {
     if (
       this.votedFor === null ||
       this.votedFor === candidateId ||
-      lastLogTerm > this.log[this.log.length - 1].term ||
-      (lastLogTerm === this.log[this.log.length - 1].term &&
+      lastLogTerm > this.log[this.log.length - 1]?.term ||
+      (lastLogTerm === this.log[this.log.length - 1]?.term &&
         lastLogIndex >= this.log.length - 1)
     ) {
       this.votedFor = candidateId;
