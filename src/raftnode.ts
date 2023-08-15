@@ -226,15 +226,29 @@ export default class RaftNode {
       term,
       prevLogIndex,
       prevLogTerm,
-      entriesCount: entries.length,
+      entries,
     });
     this.lastHeartbeat = Date.now();
+    if (this.state === "candidate") {
+      this.state = "follower";
+    }
     if (term > this.currentTerm) {
       this.currentTerm = term;
       this.votedFor = null;
       this.state = "follower";
+      return {
+        term: this.currentTerm,
+        success: false,
+      };
     }
     if (term < this.currentTerm) {
+      logger.info({
+        msg: `append entries request rejected as term is out of date`,
+        nodeId: this.nodeId,
+        leaderId,
+        term,
+        currentTerm: this.currentTerm,
+      });
       return {
         term: this.currentTerm,
         success: false,
@@ -244,7 +258,16 @@ export default class RaftNode {
     // 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
     // - this means the leader is trying to append entries to a follower that doesn't have the same log
     // as the leader
-    if (this.log.length !== 0 && this.log[prevLogIndex]?.term !== prevLogTerm) {
+    if (this.log[prevLogIndex]?.term !== prevLogTerm) {
+      logger.info({
+        msg: `append entries request rejected as log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm`,
+        nodeId: this.nodeId,
+        leaderId,
+        term,
+        prevLogIndex,
+        prevLogTerm,
+        entries,
+      });
       return {
         term: this.currentTerm,
         success: false,
@@ -257,19 +280,46 @@ export default class RaftNode {
     // - we can do this by slicing the log at prevLogIndex + 1
     // - we can then append the new entries to the log
     // - we can then set commitIndex to the minimum of leaderCommit and the index of the last new entry
-    if (this.log.length !== 0 && this.log[prevLogIndex + 1]?.term !== term) {
-      this.log = this.log.slice(0, prevLogIndex + 1);
+    for (const entry of entries) {
+      logger.info({
+        msg: `appending entry`,
+        nodeId: this.nodeId,
+        entry,
+      });
+      if (this.log[prevLogIndex + 1]?.term !== entry.term) {
+        logger.info({
+          msg: `deleting existing entry and all that follow it`,
+          nodeId: this.nodeId,
+          entry,
+        });
+        this.log = this.log.slice(0, prevLogIndex + 1);
+        break;
+      }
+      prevLogIndex++;
     }
+    prevLogTerm = this.log[prevLogIndex]?.term || 0;
     // 4. Append any new entries not already in the log
     // - this is a happy path, where the leader is trying to append entries to a follower that has the same log as the leader
     // - we can simply append the new entries to the log
     this.log.push(...entries);
+
+    logger.info({
+      msg: `appended entries`,
+      nodeId: this.nodeId,
+      entryCount: entries.length,
+      logSize: this.log.length,
+    });
 
     // 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
     // - we can then set commitIndex to the minimum of leaderCommit and the index of the last new entry
     if (leaderCommit > this.commitIndex) {
       this.commitIndex = Math.min(leaderCommit, this.log.length - 1);
     }
+    logger.info({
+      msg: `current log`,
+      nodeId: this.nodeId,
+      log: this.log,
+    });
     return {
       term: this.currentTerm,
       success: true,
@@ -338,6 +388,37 @@ export default class RaftNode {
     }
   }
 
+  private processCommand(command: string) {
+    if (this.state !== "leader") {
+      return {
+        success: false,
+        error: "not the leader",
+      };
+    }
+    this.log.push({
+      term: this.currentTerm,
+      command,
+    });
+    this.appendEntries(
+      this.currentTerm,
+      this.nodeId,
+      this.log.length - 2 || 0,
+      this.log[this.log.length - 2]?.term || 0,
+      [
+        {
+          term: this.currentTerm,
+          command,
+        },
+        ...(this.log.slice(this.log.length - 1) || []),
+      ],
+      this.commitIndex
+    );
+    this.appendEntriesToAll();
+    return {
+      success: true,
+    };
+  }
+
   requestListener: http.RequestListener = async (req, res) => {
     const { method, url } = req;
     if (method !== "POST") {
@@ -387,6 +468,17 @@ export default class RaftNode {
           voteGranted,
         })
       );
+    } else if (url === "/execute") {
+      const body = await readBody(req);
+      const { command } = JSON.parse(body);
+      const cmdOutput = this.processCommand(command);
+      if (cmdOutput.success) {
+        res.statusCode = 200;
+      } else {
+        res.statusCode = 500;
+        res.setHeader("Content-Type", "application/json");
+        res.write(JSON.stringify({ cmdOutput }));
+      }
     } else {
       res.statusCode = 404;
     }
