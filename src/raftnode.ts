@@ -63,7 +63,6 @@ export default class RaftNode {
   private state: RaftNodeState = "follower";
   private electionTimeout: number = this.setElectionTimeout();
   private lastHeartbeat: number = Date.now();
-  private lastSentMessage: number = Date.now();
 
   // persistent state on all servers
   // update on stable storage before responding to RPCs
@@ -114,17 +113,18 @@ export default class RaftNode {
     setTimeout(() => {
       this.setElectionTimeout();
       if (this.lastHeartbeat + HEARTBEAT_TIMEOUT < Date.now()) {
-        this.processCandidateTransition();
+        this.processCandidateTransition(timeout);
       }
     }, timeout);
     return timeout;
   }
 
-  private async processCandidateTransition() {
+  private async processCandidateTransition(timeout: number) {
     this.state = "candidate";
     this.currentTerm++;
     this.votedFor = null;
     this.lastHeartbeat = Date.now();
+    const startOfElection = Date.now();
     const quorum = Math.floor(this.clusterTopology.length / 2) + 1;
     logger.debug({ msg: `node is now a candidate`, nodeId: this.nodeId });
     let voteCount = 1; // we always vote for ourselves
@@ -157,7 +157,9 @@ export default class RaftNode {
         }
         if (voteRequestResponse.voteGranted) {
           voteCount++;
-          if (voteCount >= quorum) {
+          if (startOfElection + timeout! < Date.now()) {
+            this.processCandidateTransition(randomElectionTimeOut());
+          } else if (voteCount >= quorum && this.state === "candidate") {
             this.state = "leader";
             logger.info({
               msg: `node is now the leader`,
@@ -214,13 +216,14 @@ export default class RaftNode {
   } {
     // 1. Reply false if term < currentTerm - this occurs when the leader is out of date and
     // is trying to append entries to a follower that has already moved on to a new term
-    logger.debug({
+    logger.info({
       msg: `received append entries request`,
       nodeId: this.nodeId,
       leaderId,
       term,
       prevLogIndex,
       prevLogTerm,
+      entriesCount: entries.length,
     });
     this.lastHeartbeat = Date.now();
     if (term > this.currentTerm) {
