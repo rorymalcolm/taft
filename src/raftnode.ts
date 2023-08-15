@@ -24,7 +24,10 @@ async function sendRequestVoteRequest(
   port: number,
   request: RequestVoteRequest
 ): Promise<{ term: number; voteGranted: boolean }> {
-  const req = await axios.post(`http://localhost:${port}/requestVote`, request);
+  const req = await axios.post(
+    `http://localhost:${port}/raft/requestVote`,
+    request
+  );
   return await req.data;
 }
 
@@ -33,7 +36,7 @@ async function sendAppendEntriesRequest(
   request: AppendEntriesRequest
 ): Promise<{ term: number; success: boolean }> {
   const req = await axios.post(
-    `http://localhost:${port}/appendEntries`,
+    `http://localhost:${port}/raft/appendEntries`,
     request
   );
   return await req.data;
@@ -340,7 +343,7 @@ export default class RaftNode {
     if (method !== "POST") {
       res.statusCode = 405;
     }
-    if (url === "/appendEntries") {
+    if (url === "/raft/appendEntries") {
       this.state = "follower";
       const body: AppendEntriesRequest = JSON.parse(await readBody(req));
       const {
@@ -367,7 +370,7 @@ export default class RaftNode {
           success,
         })
       );
-    } else if (url === "/requestVote") {
+    } else if (url === "/raft/requestVote") {
       const body: RequestVoteRequest = JSON.parse(await readBody(req));
       const { term, candidateId, lastLogIndex, lastLogTerm } = body;
       const { term: responseTerm, voteGranted } = this.requestVote(
