@@ -10,7 +10,7 @@ import pino from "pino";
 
 const ELECTION_TIMEOUT_MIN = 150;
 const HEARTBEAT_TIMEOUT = 100;
-const HEARTBEAT_CHECK_INTERVAL = 49;
+const HEARTBEAT_INTERVAL = 25;
 
 const logger = pino();
 
@@ -78,8 +78,12 @@ export default class RaftNode {
   private lastApplied: number = 0;
 
   // volatile state on leaders
-  private nextIndex: number[] = [];
-  private matchIndex: number[] = [];
+  private nextIndex: {
+    [nodeId: number]: number;
+  } = {};
+  private matchIndex: {
+    [nodeId: number]: number;
+  } = {};
 
   constructor(
     nodeId: number,
@@ -115,7 +119,21 @@ export default class RaftNode {
     this.electionTimeout = timeout;
     setTimeout(() => {
       this.setElectionTimeout();
-      if (this.lastHeartbeat + HEARTBEAT_TIMEOUT < Date.now()) {
+      if (
+        this.lastHeartbeat + HEARTBEAT_TIMEOUT < Date.now() &&
+        this.state !== "leader"
+      ) {
+        logger.info({
+          msg: `starting election`,
+          nodeId: this.nodeId,
+          state: this.state,
+          lastHeartbeatAt: new Date(this.lastHeartbeat).toISOString(),
+          timeFromWhichWeNeedToStartAnElection: new Date(
+            this.lastHeartbeat + HEARTBEAT_TIMEOUT
+          ).toISOString(),
+          currentTimeFormatted: new Date(Date.now()).toISOString(),
+          secsSinceLastHeartbeat: (Date.now() - this.lastHeartbeat) / 1000,
+        });
         this.processCandidateTransition(timeout);
       }
     }, timeout);
@@ -126,14 +144,13 @@ export default class RaftNode {
     this.state = "candidate";
     this.currentTerm++;
     this.votedFor = null;
-    this.lastHeartbeat = Date.now();
     const startOfElection = Date.now();
     const quorum = Math.floor(this.clusterTopology.length / 2) + 1;
-    logger.debug({ msg: `node is now a candidate`, nodeId: this.nodeId });
+    logger.info({ msg: `node is now a candidate`, nodeId: this.nodeId });
     let voteCount = 1; // we always vote for ourselves
     for (const node of this.clusterTopology) {
       if (node.node !== this.nodeId && this.state === "candidate") {
-        logger.debug({
+        logger.info({
           msg: `sending vote request`,
           nodeId: this.nodeId,
           targetNodeId: node.node,
@@ -145,7 +162,7 @@ export default class RaftNode {
           lastLogIndex: this.log.length - 1,
           lastLogTerm: this.log[this.log.length - 1]?.term || 0,
         });
-        logger.debug({
+        logger.info({
           msg: `got vote response`,
           nodeId: this.nodeId,
           targetNodeId: node.node,
@@ -172,8 +189,8 @@ export default class RaftNode {
             this.nextIndex = [];
             this.matchIndex = [];
             for (let i = 0; i < this.clusterTopology.length; i++) {
-              this.nextIndex.push(this.log.length);
-              this.matchIndex.push(0);
+              this.nextIndex[i] = this.log.length + 1;
+              this.matchIndex[i] = 0;
             }
             this.appendEntriesToAll();
           }
@@ -196,14 +213,50 @@ export default class RaftNode {
     if (!node) {
       return;
     }
-    await sendAppendEntriesRequest(node.port, {
-      term: this.currentTerm,
-      leaderId: this.nodeId,
-      prevLogIndex: this.nextIndex[nodeId],
-      prevLogTerm: this.log[this.nextIndex[nodeId] - 1]?.term || 0,
-      entries: this.log.slice(this.nextIndex[nodeId]),
-      leaderCommit: this.commitIndex,
-    });
+    if (this.log.length < this.nextIndex[nodeId]) {
+      logger.info({
+        msg: `log is smaller than nextIndex`,
+        nodeId: this.nodeId,
+        targetNodeId: nodeId,
+        logSize: this.log.length,
+        nextIndex: this.nextIndex[nodeId],
+        prevLogIndex: this.nextIndex[nodeId],
+      });
+      const request = await sendAppendEntriesRequest(node.port, {
+        term: this.currentTerm,
+        leaderId: this.nodeId,
+        prevLogIndex: this.nextIndex[nodeId] - 1,
+        prevLogTerm: this.log[this.nextIndex[nodeId] - 1]?.term || 0,
+        entries: this.log.slice(this.nextIndex[nodeId]),
+        leaderCommit: this.commitIndex,
+      });
+      if (request.success) {
+        logger.info({
+          msg: `append entries request succeeded`,
+          nodeId: this.nodeId,
+          targetNodeId: nodeId,
+          term: this.currentTerm,
+          prevLogIndex: this.nextIndex[nodeId],
+          prevLogTerm: this.log[this.nextIndex[nodeId] - 1]?.term || 0,
+          entries: this.log.slice(this.nextIndex[nodeId]),
+          leaderCommit: this.commitIndex,
+        });
+        this.nextIndex[nodeId] = this.log.length;
+        this.matchIndex[nodeId] = this.log.length - 1;
+      } else {
+        logger.info({
+          msg: `append entries request failed`,
+          nodeId: this.nodeId,
+          targetNodeId: nodeId,
+          term: this.currentTerm,
+          prevLogIndex: this.nextIndex[nodeId],
+          prevLogTerm: this.log[this.nextIndex[nodeId] - 1]?.term || 0,
+          entries: this.log.slice(this.nextIndex[nodeId]),
+          leaderCommit: this.commitIndex,
+        });
+        this.nextIndex[nodeId]--;
+      }
+    }
   }
 
   private appendEntries(
@@ -258,15 +311,21 @@ export default class RaftNode {
     // 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
     // - this means the leader is trying to append entries to a follower that doesn't have the same log
     // as the leader
-    if (this.log[prevLogIndex]?.term !== prevLogTerm) {
+    if (
+      this.log[prevLogIndex]?.term !== prevLogTerm &&
+      prevLogIndex !== 0 &&
+      prevLogTerm !== 0 &&
+      this.log.length > 0
+    ) {
       logger.info({
         msg: `append entries request rejected as log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm`,
         nodeId: this.nodeId,
         leaderId,
         term,
+        logSize: this.log.length,
+        logTerm: this.log[prevLogIndex]?.term,
         prevLogIndex,
         prevLogTerm,
-        entries,
       });
       return {
         term: this.currentTerm,
@@ -373,32 +432,30 @@ export default class RaftNode {
   }
 
   private heartbeat() {
-    setTimeout(() => this.heartbeat(), HEARTBEAT_CHECK_INTERVAL);
-    if (
-      this.state !== "leader" ||
-      Date.now() - this.lastHeartbeat < HEARTBEAT_CHECK_INTERVAL
-    ) {
+    if (this.state !== "leader") {
       return;
     }
     for (const node of this.clusterTopology) {
       if (node.node !== this.nodeId) {
-        this.lastHeartbeat = Date.now();
         this.appendEntriesToNode(node.node);
       }
     }
+    setTimeout(() => this.heartbeat(), HEARTBEAT_INTERVAL);
   }
 
   private processCommand(command: string) {
+    logger.info({
+      msg: `processing command`,
+      nodeId: this.nodeId,
+      command,
+      state: this.state,
+    });
     if (this.state !== "leader") {
       return {
         success: false,
         error: "not the leader",
       };
     }
-    this.log.push({
-      term: this.currentTerm,
-      command,
-    });
     this.appendEntries(
       this.currentTerm,
       this.nodeId,
@@ -469,6 +526,10 @@ export default class RaftNode {
         })
       );
     } else if (url === "/execute") {
+      logger.info({
+        msg: `received command`,
+        nodeId: this.nodeId,
+      });
       const body = await readBody(req);
       const { command } = JSON.parse(body);
       const cmdOutput = this.processCommand(command);
