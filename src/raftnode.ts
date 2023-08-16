@@ -1,5 +1,5 @@
 import http from "http";
-import axios from "axios";
+
 import {
   RequestVoteRequest,
   AppendEntriesRequest,
@@ -7,6 +7,11 @@ import {
   LogEntry,
 } from "./types";
 import pino from "pino";
+import {
+  readBody,
+  sendAppendEntriesRequest,
+  sendRequestVoteRequest,
+} from "./utils";
 
 const ELECTION_TIMEOUT_MIN = 150;
 const HEARTBEAT_TIMEOUT = 100;
@@ -18,43 +23,6 @@ function randomElectionTimeOut() {
   return (
     Math.floor(Math.random() * ELECTION_TIMEOUT_MIN) + ELECTION_TIMEOUT_MIN
   );
-}
-
-async function sendRequestVoteRequest(
-  port: number,
-  request: RequestVoteRequest
-): Promise<{ term: number; voteGranted: boolean }> {
-  const req = await axios.post(
-    `http://localhost:${port}/raft/requestVote`,
-    request
-  );
-  return await req.data;
-}
-
-async function sendAppendEntriesRequest(
-  port: number,
-  request: AppendEntriesRequest
-): Promise<{ term: number; success: boolean }> {
-  const req = await axios.post(
-    `http://localhost:${port}/raft/appendEntries`,
-    request
-  );
-  return await req.data;
-}
-
-async function readBody(request: http.IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    request.on("data", (chunk) => {
-      body += chunk;
-    });
-    request.on("end", () => {
-      resolve(body);
-    });
-    request.on("error", (error) => {
-      reject(error);
-    });
-  });
 }
 
 export default class RaftNode {
@@ -100,18 +68,6 @@ export default class RaftNode {
     this.port = port;
     this.clusterTopology = cluster;
     this.heartbeat();
-  }
-
-  getNodeId() {
-    return this.nodeId;
-  }
-
-  getPort() {
-    return this.port;
-  }
-
-  getState() {
-    return this.state;
   }
 
   private setElectionTimeout() {
@@ -413,11 +369,10 @@ export default class RaftNode {
     // - this is a happy path, where the candidate is up to date and can become leader
     // - we can simply set votedFor to candidateId and return true
     if (
-      this.votedFor === null ||
-      this.votedFor === candidateId ||
-      lastLogTerm > this.log[this.log.length - 1]?.term ||
-      (lastLogTerm === this.log[this.log.length - 1]?.term &&
-        lastLogIndex >= this.log.length - 1)
+      (this.votedFor === null || this.votedFor === candidateId) &&
+      (lastLogTerm > (this.log[this.log.length - 1]?.term || 0) ||
+        (lastLogTerm === (this.log[this.log.length - 1]?.term || 0) &&
+          lastLogIndex >= this.log.length))
     ) {
       this.votedFor = candidateId;
       return {
