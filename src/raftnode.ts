@@ -14,6 +14,7 @@ import {
 } from "./utils";
 
 const ELECTION_TIMEOUT_MIN = 150;
+const ELECTION_TIMEOUT_MAX = 300; // Added randomization range
 const HEARTBEAT_TIMEOUT = 100;
 const HEARTBEAT_INTERVAL = 25;
 
@@ -21,7 +22,8 @@ const logger = pino();
 
 function randomElectionTimeOut() {
   return (
-    Math.floor(Math.random() * ELECTION_TIMEOUT_MIN) + ELECTION_TIMEOUT_MIN
+    Math.floor(Math.random() * (ELECTION_TIMEOUT_MAX - ELECTION_TIMEOUT_MIN)) +
+    ELECTION_TIMEOUT_MIN
   );
 }
 
@@ -34,6 +36,7 @@ export default class RaftNode {
   private state: RaftNodeState = "follower";
   private electionTimeout: number = this.setElectionTimeout();
   private lastHeartbeat: number = Date.now();
+  private heartbeatTimer: NodeJS.Timeout | null = null;
 
   // persistent state on all servers
   // update on stable storage before responding to RPCs
@@ -46,12 +49,8 @@ export default class RaftNode {
   private lastApplied: number = 0;
 
   // volatile state on leaders
-  private nextIndex: {
-    [nodeId: number]: number;
-  } = {};
-  private matchIndex: {
-    [nodeId: number]: number;
-  } = {};
+  private nextIndex: Record<number, number> = {}; // Changed to Record/Map
+  private matchIndex: Record<number, number> = {}; // Changed to Record/Map
 
   constructor(
     nodeId: number,
@@ -67,14 +66,16 @@ export default class RaftNode {
     this.nodeId = nodeId;
     this.port = port;
     this.clusterTopology = cluster;
-    this.heartbeat();
+
+    // Initialize with a no-op entry at index 0
+    this.log.push({ term: 0, command: "" });
   }
 
   private setElectionTimeout() {
     const timeout = randomElectionTimeOut();
     this.electionTimeout = timeout;
     setTimeout(() => {
-      this.setElectionTimeout();
+      // Check if we should start an election
       if (
         this.lastHeartbeat + HEARTBEAT_TIMEOUT < Date.now() &&
         this.state !== "leader"
@@ -90,128 +91,305 @@ export default class RaftNode {
           currentTimeFormatted: new Date(Date.now()).toISOString(),
           secsSinceLastHeartbeat: (Date.now() - this.lastHeartbeat) / 1000,
         });
-        this.processCandidateTransition(timeout);
+        this.processCandidateTransition();
+      } else {
+        // Reset the election timeout if we're not starting an election
+        this.setElectionTimeout();
       }
     }, timeout);
     return timeout;
   }
 
-  private async processCandidateTransition(timeout: number) {
+  private async processCandidateTransition() {
     this.state = "candidate";
-    this.currentTerm++;
-    this.votedFor = null;
+    this.currentTerm++; // Increment term
+    this.votedFor = this.nodeId; // Vote for self - fixed this!
+
+    logger.info({
+      msg: `node is now a candidate`,
+      nodeId: this.nodeId,
+      term: this.currentTerm,
+    });
+
+    // Start new election timer in case this election fails
+    const electionTimeout = randomElectionTimeOut();
     const startOfElection = Date.now();
+
+    // Calculate votes needed for majority
     const quorum = Math.floor(this.clusterTopology.length / 2) + 1;
-    logger.info({ msg: `node is now a candidate`, nodeId: this.nodeId });
-    let voteCount = 1; // we always vote for ourselves
-    for (const node of this.clusterTopology) {
-      if (node.node !== this.nodeId && this.state === "candidate") {
+    let voteCount = 1; // Count self vote
+
+    // Request votes from all other servers
+    const voteRequests = this.clusterTopology
+      .filter((node) => node.node !== this.nodeId)
+      .map(async (node) => {
+        if (this.state !== "candidate") return; // Stop if no longer a candidate
+
         logger.info({
           msg: `sending vote request`,
           nodeId: this.nodeId,
           targetNodeId: node.node,
           port: node.port,
+          term: this.currentTerm,
         });
-        const voteRequestResponse = await sendRequestVoteRequest(node.port, {
+
+        // Prepare vote request with correct log information
+        const lastLogIndex = this.log.length - 1;
+        const lastLogTerm = this.log[lastLogIndex]?.term || 0;
+
+        const voteResponse = await sendRequestVoteRequest(node.port, {
           term: this.currentTerm,
           candidateId: this.nodeId,
-          lastLogIndex: this.log.length - 1,
-          lastLogTerm: this.log[this.log.length - 1]?.term || 0,
+          lastLogIndex: lastLogIndex,
+          lastLogTerm: lastLogTerm,
         });
+
+        // Handle the response
         logger.info({
           msg: `got vote response`,
           nodeId: this.nodeId,
           targetNodeId: node.node,
           port: node.port,
-          voteRequestResponse,
+          voteResponse,
         });
-        if (voteRequestResponse.term > this.currentTerm) {
-          this.currentTerm = voteRequestResponse.term;
+
+        // If we discover a higher term, revert to follower
+        if (voteResponse.term > this.currentTerm) {
+          this.currentTerm = voteResponse.term;
           this.state = "follower";
           this.votedFor = null;
+          this.lastHeartbeat = Date.now(); // Reset heartbeat timer
           return;
         }
-        if (voteRequestResponse.voteGranted) {
+
+        // Count the vote if granted
+        if (voteResponse.voteGranted && this.state === "candidate") {
           voteCount++;
-          if (startOfElection + timeout! < Date.now()) {
-            this.processCandidateTransition(randomElectionTimeOut());
-          } else if (voteCount >= quorum && this.state === "candidate") {
-            this.state = "leader";
-            logger.info({
-              msg: `node is now the leader`,
-              nodeId: this.nodeId,
-              term: this.currentTerm,
-            });
-            this.nextIndex = [];
-            this.matchIndex = [];
-            for (let i = 0; i < this.clusterTopology.length; i++) {
-              this.nextIndex[i] = this.log.length + 1;
-              this.matchIndex[i] = 0;
-            }
-            this.appendEntriesToAll();
+
+          // Check if we have a majority
+          if (voteCount >= quorum) {
+            // We won the election!
+            this.becomeLeader();
           }
         }
-      }
+      });
+
+    // Wait for all vote requests to complete or timeout
+    await Promise.all(voteRequests).catch((err) => {
+      logger.error({ msg: "Error in vote requests", error: err });
+    });
+
+    // If election timeout elapses and we're still a candidate, start a new election
+    if (this.state === "candidate") {
+      setTimeout(() => {
+        if (this.state === "candidate") {
+          logger.info({
+            msg: `election timeout elapsed, starting new election`,
+            nodeId: this.nodeId,
+            term: this.currentTerm,
+          });
+          this.processCandidateTransition();
+        }
+      }, electionTimeout);
     }
-    this.setElectionTimeout();
   }
 
-  private appendEntriesToAll() {
+  private becomeLeader() {
+    if (this.state !== "candidate") return;
+
+    this.state = "leader";
+    logger.info({
+      msg: `node is now the leader`,
+      nodeId: this.nodeId,
+      term: this.currentTerm,
+    });
+
+    // Initialize leader state
+    this.nextIndex = {};
+    this.matchIndex = {};
+
+    // Initialize nextIndex to the length of our log, and matchIndex to 0
     for (const node of this.clusterTopology) {
       if (node.node !== this.nodeId) {
-        this.appendEntriesToNode(node.node);
+        this.nextIndex[node.node] = this.log.length;
+        this.matchIndex[node.node] = 0;
+      }
+    }
+
+    // Send initial empty append entries (heartbeats)
+    this.sendHeartbeats();
+
+    // Start periodic heartbeats
+    this.startHeartbeatTimer();
+  }
+
+  private startHeartbeatTimer() {
+    // Clear any existing timer
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+    }
+
+    // Start a new timer
+    this.heartbeatTimer = setInterval(() => {
+      if (this.state === "leader") {
+        this.sendHeartbeats();
+      } else {
+        // If we're no longer the leader, stop sending heartbeats
+        this.stopHeartbeatTimer();
+      }
+    }, HEARTBEAT_INTERVAL);
+  }
+
+  private stopHeartbeatTimer() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  private sendHeartbeats() {
+    if (this.state !== "leader") return;
+
+    for (const node of this.clusterTopology) {
+      if (node.node !== this.nodeId) {
+        this.replicateLogsToFollower(node.node);
       }
     }
   }
 
-  private async appendEntriesToNode(nodeId: number) {
+  private async replicateLogsToFollower(nodeId: number) {
+    if (this.state !== "leader") return;
+
     const node = this.clusterTopology.find((n) => n.node === nodeId);
-    if (!node) {
-      return;
-    }
-    if (this.log.length < this.nextIndex[nodeId]) {
-      logger.info({
-        msg: `log is smaller than nextIndex`,
-        nodeId: this.nodeId,
-        targetNodeId: nodeId,
-        logSize: this.log.length,
-        nextIndex: this.nextIndex[nodeId],
-        prevLogIndex: this.nextIndex[nodeId],
-      });
-      const request = await sendAppendEntriesRequest(node.port, {
+    if (!node) return;
+
+    const prevLogIndex = this.nextIndex[nodeId] - 1;
+    const prevLogTerm = this.log[prevLogIndex]?.term || 0;
+    const entries = this.log.slice(this.nextIndex[nodeId]);
+
+    logger.info({
+      msg: `sending append entries`,
+      nodeId: this.nodeId,
+      targetNodeId: nodeId,
+      prevLogIndex,
+      prevLogTerm,
+      entriesCount: entries.length,
+      nextIndex: this.nextIndex[nodeId],
+    });
+
+    try {
+      const response = await sendAppendEntriesRequest(node.port, {
         term: this.currentTerm,
         leaderId: this.nodeId,
-        prevLogIndex: this.nextIndex[nodeId] - 1,
-        prevLogTerm: this.log[this.nextIndex[nodeId] - 1]?.term || 0,
-        entries: this.log.slice(this.nextIndex[nodeId]),
+        prevLogIndex,
+        prevLogTerm,
+        entries,
         leaderCommit: this.commitIndex,
       });
-      if (request.success) {
-        logger.info({
-          msg: `append entries request succeeded`,
-          nodeId: this.nodeId,
-          targetNodeId: nodeId,
-          term: this.currentTerm,
-          prevLogIndex: this.nextIndex[nodeId],
-          prevLogTerm: this.log[this.nextIndex[nodeId] - 1]?.term || 0,
-          entries: this.log.slice(this.nextIndex[nodeId]),
-          leaderCommit: this.commitIndex,
-        });
-        this.nextIndex[nodeId] = this.log.length;
-        this.matchIndex[nodeId] = this.log.length - 1;
-      } else {
-        logger.info({
-          msg: `append entries request failed`,
-          nodeId: this.nodeId,
-          targetNodeId: nodeId,
-          term: this.currentTerm,
-          prevLogIndex: this.nextIndex[nodeId],
-          prevLogTerm: this.log[this.nextIndex[nodeId] - 1]?.term || 0,
-          entries: this.log.slice(this.nextIndex[nodeId]),
-          leaderCommit: this.commitIndex,
-        });
-        this.nextIndex[nodeId]--;
+
+      // If we discover a higher term, revert to follower
+      if (response.term > this.currentTerm) {
+        this.currentTerm = response.term;
+        this.state = "follower";
+        this.votedFor = null;
+        this.stopHeartbeatTimer();
+        return;
       }
+
+      if (response.success) {
+        // Update our tracking of the follower's log state
+        if (entries.length > 0) {
+          this.nextIndex[nodeId] = prevLogIndex + entries.length + 1;
+          this.matchIndex[nodeId] = prevLogIndex + entries.length;
+
+          logger.info({
+            msg: `append entries successful`,
+            nodeId: this.nodeId,
+            targetNodeId: nodeId,
+            newNextIndex: this.nextIndex[nodeId],
+            newMatchIndex: this.matchIndex[nodeId],
+          });
+
+          // Try to advance the commit index
+          this.updateCommitIndex();
+        }
+      } else {
+        // Follower rejected the append - decrement nextIndex and retry
+        this.nextIndex[nodeId] = Math.max(1, this.nextIndex[nodeId] - 1);
+
+        logger.info({
+          msg: `append entries failed, retrying with earlier entry`,
+          nodeId: this.nodeId,
+          targetNodeId: nodeId,
+          newNextIndex: this.nextIndex[nodeId],
+        });
+
+        // Schedule immediate retry
+        setImmediate(() => this.replicateLogsToFollower(nodeId));
+      }
+    } catch (error) {
+      logger.error({
+        msg: `error sending append entries`,
+        nodeId: this.nodeId,
+        targetNodeId: nodeId,
+        error,
+      });
+    }
+  }
+
+  private updateCommitIndex() {
+    // Implement the leader commit rule (§5.3, §5.4):
+    // If there exists an N such that N > commitIndex, a majority of
+    // matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
+
+    if (this.state !== "leader") return;
+
+    // Look for highest N that meets criteria
+    for (let n = this.log.length - 1; n > this.commitIndex; n--) {
+      // Only consider entries from current term
+      if (this.log[n].term !== this.currentTerm) continue;
+
+      // Count servers that have this entry
+      let matchCount = 1; // Count self
+
+      for (const node of this.clusterTopology) {
+        if (node.node !== this.nodeId && this.matchIndex[node.node] >= n) {
+          matchCount++;
+        }
+      }
+
+      // If we have a majority, commit up to this index
+      if (matchCount > this.clusterTopology.length / 2) {
+        logger.info({
+          msg: `advancing commit index`,
+          nodeId: this.nodeId,
+          oldCommitIndex: this.commitIndex,
+          newCommitIndex: n,
+        });
+
+        this.commitIndex = n;
+        this.applyLogEntries();
+        break;
+      }
+    }
+  }
+
+  private applyLogEntries() {
+    // Apply committed entries to state machine
+    while (this.lastApplied < this.commitIndex) {
+      this.lastApplied++;
+
+      const entry = this.log[this.lastApplied];
+      logger.info({
+        msg: `applying log entry to state machine`,
+        nodeId: this.nodeId,
+        index: this.lastApplied,
+        term: entry.term,
+        command: entry.command,
+      });
+
+      // In a real implementation, you would apply the command to your state machine here
+      // For this example, we simply log it
     }
   }
 
@@ -226,8 +404,6 @@ export default class RaftNode {
     term: number;
     success: boolean;
   } {
-    // 1. Reply false if term < currentTerm - this occurs when the leader is out of date and
-    // is trying to append entries to a follower that has already moved on to a new term
     logger.info({
       msg: `received append entries request`,
       nodeId: this.nodeId,
@@ -235,106 +411,128 @@ export default class RaftNode {
       term,
       prevLogIndex,
       prevLogTerm,
-      entries,
+      entriesCount: entries.length,
     });
+
+    // Update last heartbeat time
     this.lastHeartbeat = Date.now();
+
+    // Handle term comparison (Rule 1)
+    if (term > this.currentTerm) {
+      logger.info({
+        msg: `discovered higher term`,
+        nodeId: this.nodeId,
+        oldTerm: this.currentTerm,
+        newTerm: term,
+      });
+
+      this.currentTerm = term;
+      this.state = "follower";
+      this.votedFor = null;
+    }
+
+    // Reject if term is less than current term
+    if (term < this.currentTerm) {
+      logger.info({
+        msg: `rejecting append entries - term too old`,
+        nodeId: this.nodeId,
+        messageTerm: term,
+        currentTerm: this.currentTerm,
+      });
+
+      return {
+        term: this.currentTerm,
+        success: false,
+      };
+    }
+
+    // Revert to follower if we're a candidate
     if (this.state === "candidate") {
       this.state = "follower";
     }
-    if (term > this.currentTerm) {
-      this.currentTerm = term;
-      this.votedFor = null;
-      this.state = "follower";
-      return {
-        term: this.currentTerm,
-        success: false,
-      };
-    }
-    if (term < this.currentTerm) {
-      logger.info({
-        msg: `append entries request rejected as term is out of date`,
-        nodeId: this.nodeId,
-        leaderId,
-        term,
-        currentTerm: this.currentTerm,
-      });
-      return {
-        term: this.currentTerm,
-        success: false,
-      };
-    }
 
-    // 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
-    // - this means the leader is trying to append entries to a follower that doesn't have the same log
-    // as the leader
+    // Check for log consistency (Rule 2)
     if (
-      this.log[prevLogIndex]?.term !== prevLogTerm &&
-      prevLogIndex !== 0 &&
-      prevLogTerm !== 0 &&
-      this.log.length > 0
+      prevLogIndex >= this.log.length ||
+      (prevLogIndex > 0 && this.log[prevLogIndex].term !== prevLogTerm)
     ) {
       logger.info({
-        msg: `append entries request rejected as log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm`,
+        msg: `rejecting append entries - log inconsistency`,
         nodeId: this.nodeId,
-        leaderId,
-        term,
-        logSize: this.log.length,
-        logTerm: this.log[prevLogIndex]?.term,
+        logLength: this.log.length,
         prevLogIndex,
         prevLogTerm,
+        actualTermAtPrevIndex:
+          prevLogIndex < this.log.length ? this.log[prevLogIndex].term : "none",
       });
+
       return {
         term: this.currentTerm,
         success: false,
       };
     }
 
-    // 3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
-    // - this means the leader is trying to append entries to a follower that has a different log than the leader
-    // - this is a bit more complicated, because we need to delete the entry at prevLogIndex and all that follow it
-    // - we can do this by slicing the log at prevLogIndex + 1
-    // - we can then append the new entries to the log
-    // - we can then set commitIndex to the minimum of leaderCommit and the index of the last new entry
-    for (const entry of entries) {
-      logger.info({
-        msg: `appending entry`,
-        nodeId: this.nodeId,
-        entry,
-      });
-      if (this.log[prevLogIndex + 1]?.term !== entry.term) {
-        logger.info({
-          msg: `deleting existing entry and all that follow it`,
-          nodeId: this.nodeId,
-          entry,
-        });
-        this.log = this.log.slice(0, prevLogIndex + 1);
-        break;
+    // Handle log conflicts (Rule 3)
+    if (entries.length > 0) {
+      let newEntryIndex = prevLogIndex + 1;
+
+      for (let i = 0; i < entries.length; i++) {
+        if (newEntryIndex < this.log.length) {
+          // Check for conflicts
+          if (this.log[newEntryIndex].term !== entries[i].term) {
+            // Delete this and all following entries
+            logger.info({
+              msg: `deleting conflicting entries`,
+              nodeId: this.nodeId,
+              fromIndex: newEntryIndex,
+              existingTerm: this.log[newEntryIndex].term,
+              newTerm: entries[i].term,
+            });
+
+            this.log = this.log.slice(0, newEntryIndex);
+            // Then we'll append the new entry below
+            break;
+          }
+        } else {
+          // We've reached the end of our log, break to append entries
+          break;
+        }
+
+        newEntryIndex++;
       }
-      prevLogIndex++;
+
+      // Append any new entries not already in the log (Rule 4)
+      for (let i = 0; i < entries.length; i++) {
+        const entryIndex = prevLogIndex + 1 + i;
+
+        if (entryIndex >= this.log.length) {
+          this.log.push(entries[i]);
+
+          logger.info({
+            msg: `appended new entry`,
+            nodeId: this.nodeId,
+            index: entryIndex,
+            term: entries[i].term,
+          });
+        }
+      }
     }
-    prevLogTerm = this.log[prevLogIndex]?.term || 0;
-    // 4. Append any new entries not already in the log
-    // - this is a happy path, where the leader is trying to append entries to a follower that has the same log as the leader
-    // - we can simply append the new entries to the log
-    this.log.push(...entries);
 
-    logger.info({
-      msg: `appended entries`,
-      nodeId: this.nodeId,
-      entryCount: entries.length,
-      logSize: this.log.length,
-    });
-
-    // 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-    // - we can then set commitIndex to the minimum of leaderCommit and the index of the last new entry
+    // Update commit index if needed (Rule 5)
     if (leaderCommit > this.commitIndex) {
-      this.commitIndex = Math.min(leaderCommit, this.log.length - 1);
+      const lastNewEntryIndex = prevLogIndex + entries.length;
+      this.commitIndex = Math.min(leaderCommit, lastNewEntryIndex);
+
+      logger.info({
+        msg: `updating commit index`,
+        nodeId: this.nodeId,
+        newCommitIndex: this.commitIndex,
+      });
+
+      // Apply newly committed entries
+      this.applyLogEntries();
     }
-    logger.info({
-      msg: `current log`,
-      nodeId: this.nodeId,
-      log: this.log,
-    });
+
     return {
       term: this.currentTerm,
       success: true,
@@ -350,154 +548,238 @@ export default class RaftNode {
     term: number;
     voteGranted: boolean;
   } {
-    // 1. Reply false if term < currentTerm
-    // - this occurs when the candidate is out of date and is trying to become leader
+    logger.info({
+      msg: `received vote request`,
+      nodeId: this.nodeId,
+      candidateId,
+      term,
+      lastLogIndex,
+      lastLogTerm,
+    });
+
+    // Update last heartbeat to avoid starting an election
     this.lastHeartbeat = Date.now();
+
+    // Handle term comparison
     if (term > this.currentTerm) {
+      logger.info({
+        msg: `discovered higher term in vote request`,
+        nodeId: this.nodeId,
+        oldTerm: this.currentTerm,
+        newTerm: term,
+      });
+
       this.currentTerm = term;
-      this.votedFor = null;
       this.state = "follower";
+      this.votedFor = null;
     }
+
+    // Reject if term is less than current term
     if (term < this.currentTerm) {
+      logger.info({
+        msg: `rejecting vote - term too old`,
+        nodeId: this.nodeId,
+        messageTerm: term,
+        currentTerm: this.currentTerm,
+      });
+
       return {
         term: this.currentTerm,
         voteGranted: false,
       };
     }
-    // 2. If votedFor is null or candidateId, and candidate’s log is at
-    // least as up-to-date as receiver’s log, grant vote
-    // - this is a happy path, where the candidate is up to date and can become leader
-    // - we can simply set votedFor to candidateId and return true
-    if (
+
+    // Check if we can vote for this candidate (Rule 2)
+    // - We haven't voted for another candidate in this term
+    // - The candidate's log is at least as up-to-date as ours
+    const ourLastLogIndex = this.log.length - 1;
+    const ourLastLogTerm = this.log[ourLastLogIndex]?.term || 0;
+
+    const canVote =
       (this.votedFor === null || this.votedFor === candidateId) &&
-      (lastLogTerm > (this.log[this.log.length - 1]?.term || 0) ||
-        (lastLogTerm === (this.log[this.log.length - 1]?.term || 0) &&
-          lastLogIndex >= this.log.length))
-    ) {
+      (lastLogTerm > ourLastLogTerm ||
+        (lastLogTerm === ourLastLogTerm && lastLogIndex >= ourLastLogIndex));
+
+    if (canVote) {
+      logger.info({
+        msg: `granting vote`,
+        nodeId: this.nodeId,
+        candidateId,
+        term,
+      });
+
       this.votedFor = candidateId;
       return {
         term: this.currentTerm,
         voteGranted: true,
       };
+    } else {
+      logger.info({
+        msg: `rejecting vote`,
+        nodeId: this.nodeId,
+        candidateId,
+        term,
+        votedFor: this.votedFor,
+        ourLastLogTerm,
+        ourLastLogIndex,
+      });
+
+      return {
+        term: this.currentTerm,
+        voteGranted: false,
+      };
     }
-    return {
-      term: this.currentTerm,
-      voteGranted: false,
-    };
   }
 
-  private heartbeat() {
-    if (this.state !== "leader") {
-      return;
-    }
-    for (const node of this.clusterTopology) {
-      if (node.node !== this.nodeId) {
-        this.appendEntriesToNode(node.node);
-      }
-    }
-    setTimeout(() => this.heartbeat(), HEARTBEAT_INTERVAL);
-  }
-
-  private processCommand(command: string) {
+  public processCommand(command: string) {
     logger.info({
       msg: `processing command`,
       nodeId: this.nodeId,
       command,
       state: this.state,
     });
+
+    // Only leaders can process commands
     if (this.state !== "leader") {
       return {
         success: false,
         error: "not the leader",
+        leader:
+          this.clusterTopology.find((node) => node.node === this.getLeaderId())
+            ?.port || null,
       };
     }
-    this.appendEntries(
-      this.currentTerm,
-      this.nodeId,
-      this.log.length - 2 || 0,
-      this.log[this.log.length - 2]?.term || 0,
-      [
-        {
-          term: this.currentTerm,
-          command,
-        },
-        ...(this.log.slice(this.log.length - 1) || []),
-      ],
-      this.commitIndex
-    );
-    this.appendEntriesToAll();
+
+    // Add the new command to our log
+    const newEntry: LogEntry = {
+      term: this.currentTerm,
+      command,
+    };
+
+    this.log.push(newEntry);
+
+    const entryIndex = this.log.length - 1;
+
+    logger.info({
+      msg: `added command to log`,
+      nodeId: this.nodeId,
+      index: entryIndex,
+      term: this.currentTerm,
+    });
+
+    // Trigger immediate replication to followers
+    this.sendHeartbeats();
+
     return {
       success: true,
+      index: entryIndex,
     };
   }
 
-  requestListener: http.RequestListener = async (req, res) => {
+  private getLeaderId(): number | null {
+    // In a real implementation, we might track the current leader
+    // For now, just return null if we don't know
+    if (this.state === "leader") {
+      return this.nodeId;
+    }
+
+    return null; // We don't know the leader
+  }
+
+  public requestListener: http.RequestListener = async (req, res) => {
     const { method, url } = req;
+
     if (method !== "POST") {
       res.statusCode = 405;
+      res.end("Method Not Allowed");
+      return;
     }
-    if (url === "/raft/appendEntries") {
-      this.state = "follower";
-      const body: AppendEntriesRequest = JSON.parse(await readBody(req));
-      const {
-        term,
-        leaderId,
-        prevLogIndex,
-        prevLogTerm,
-        entries,
-        leaderCommit,
-      } = body;
-      const { term: responseTerm, success } = this.appendEntries(
-        term,
-        leaderId,
-        prevLogIndex,
-        prevLogTerm,
-        entries,
-        leaderCommit
-      );
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "application/json");
-      res.write(
-        JSON.stringify({
-          term: responseTerm,
-          success,
-        })
-      );
-    } else if (url === "/raft/requestVote") {
-      const body: RequestVoteRequest = JSON.parse(await readBody(req));
-      const { term, candidateId, lastLogIndex, lastLogTerm } = body;
-      const { term: responseTerm, voteGranted } = this.requestVote(
-        term,
-        candidateId,
-        lastLogIndex,
-        lastLogTerm
-      );
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "application/json");
-      res.write(
-        JSON.stringify({
-          term: responseTerm,
-          voteGranted,
-        })
-      );
-    } else if (url === "/execute") {
-      logger.info({
-        msg: `received command`,
-        nodeId: this.nodeId,
-      });
-      const body = await readBody(req);
-      const { command } = JSON.parse(body);
-      const cmdOutput = this.processCommand(command);
-      if (cmdOutput.success) {
+
+    try {
+      if (url === "/raft/appendEntries") {
+        const body: AppendEntriesRequest = JSON.parse(await readBody(req));
+        const {
+          term,
+          leaderId,
+          prevLogIndex,
+          prevLogTerm,
+          entries,
+          leaderCommit,
+        } = body;
+
+        const response = this.appendEntries(
+          term,
+          leaderId,
+          prevLogIndex,
+          prevLogTerm,
+          entries,
+          leaderCommit
+        );
+
         res.statusCode = 200;
-      } else {
-        res.statusCode = 500;
         res.setHeader("Content-Type", "application/json");
-        res.write(JSON.stringify({ cmdOutput }));
+        res.write(JSON.stringify(response));
+        res.end();
+      } else if (url === "/raft/requestVote") {
+        const body: RequestVoteRequest = JSON.parse(await readBody(req));
+        const { term, candidateId, lastLogIndex, lastLogTerm } = body;
+
+        const response = this.requestVote(
+          term,
+          candidateId,
+          lastLogIndex,
+          lastLogTerm
+        );
+
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json");
+        res.write(JSON.stringify(response));
+        res.end();
+      } else if (url === "/execute") {
+        logger.info({
+          msg: `received command request`,
+          nodeId: this.nodeId,
+        });
+
+        const body = await readBody(req);
+        const { command } = JSON.parse(body);
+
+        const response = this.processCommand(command);
+
+        res.statusCode = response.success ? 200 : 500;
+        res.setHeader("Content-Type", "application/json");
+        res.write(JSON.stringify(response));
+        res.end();
+      } else if (url === "/status") {
+        // A debug endpoint to get the node's state
+        const status = {
+          nodeId: this.nodeId,
+          state: this.state,
+          currentTerm: this.currentTerm,
+          votedFor: this.votedFor,
+          logLength: this.log.length,
+          commitIndex: this.commitIndex,
+          lastApplied: this.lastApplied,
+          leader: this.getLeaderId(),
+        };
+
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json");
+        res.write(JSON.stringify(status));
+        res.end();
+      } else {
+        res.statusCode = 404;
+        res.end("Not Found");
       }
-    } else {
-      res.statusCode = 404;
+    } catch (error) {
+      logger.error({
+        msg: `error handling request`,
+        url,
+        error,
+      });
+
+      res.statusCode = 500;
+      res.end("Internal Server Error");
     }
-    res.end();
   };
 }
