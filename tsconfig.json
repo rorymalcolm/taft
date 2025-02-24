@@ -1,21 +1,15 @@
 {
   "compilerOptions": {
-    "outDir": "./dist",
-    "allowJs": true,
-    "target": "es2017",
-    "strict": true,
+    "target": "ES2020",
     "module": "commonjs",
-    "moduleResolution": "node",
-    "jsx": "react",
-    "experimentalDecorators": true,
-    "strictNullChecks": true,
-    "allowSyntheticDefaultImports": true,
-    "sourceMap": true,
-    "esModuleInterop": true
+    "lib": ["es2020"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "outDir": "dist",
+    "resolveJsonModule": true
   },
-  "include": ["./src/**/*"],
-  "exclude": ["node_modules"],
-  "ts-node": {
-    "files": true
-  }
+  "include": ["src/**/*"],
+  "exclude": ["node_modules"]
 }

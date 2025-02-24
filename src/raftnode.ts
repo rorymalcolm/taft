@@ -30,7 +30,7 @@ function randomElectionTimeOut() {
 export default class RaftNode {
   private nodeId = 0;
   private port = 0;
-  private clusterTopology: { node: number; port: number }[] = [];
+  private clusterTopology: { nodeId: number; port: number }[] = [];
 
   // raft node state and timeout
   private state: RaftNodeState = "follower";
@@ -55,7 +55,7 @@ export default class RaftNode {
   constructor(
     nodeId: number,
     port: number,
-    cluster: { node: number; port: number }[]
+    cluster: { nodeId: number; port: number }[]
   ) {
     logger.info({
       msg: `starting node`,
@@ -121,14 +121,14 @@ export default class RaftNode {
 
     // Request votes from all other servers
     const voteRequests = this.clusterTopology
-      .filter((node) => node.node !== this.nodeId)
+      .filter((node) => node.nodeId !== this.nodeId)
       .map(async (node) => {
         if (this.state !== "candidate") return; // Stop if no longer a candidate
 
         logger.info({
           msg: `sending vote request`,
           nodeId: this.nodeId,
-          targetNodeId: node.node,
+          targetNodeId: node.nodeId,
           port: node.port,
           term: this.currentTerm,
         });
@@ -148,7 +148,7 @@ export default class RaftNode {
         logger.info({
           msg: `got vote response`,
           nodeId: this.nodeId,
-          targetNodeId: node.node,
+          targetNodeId: node.nodeId,
           port: node.port,
           voteResponse,
         });
@@ -210,9 +210,9 @@ export default class RaftNode {
 
     // Initialize nextIndex to the length of our log, and matchIndex to 0
     for (const node of this.clusterTopology) {
-      if (node.node !== this.nodeId) {
-        this.nextIndex[node.node] = this.log.length;
-        this.matchIndex[node.node] = 0;
+      if (node.nodeId !== this.nodeId) {
+        this.nextIndex[node.nodeId] = this.log.length;
+        this.matchIndex[node.nodeId] = 0;
       }
     }
 
@@ -251,8 +251,8 @@ export default class RaftNode {
     if (this.state !== "leader") return;
 
     for (const node of this.clusterTopology) {
-      if (node.node !== this.nodeId) {
-        this.replicateLogsToFollower(node.node);
+      if (node.nodeId !== this.nodeId) {
+        this.replicateLogsToFollower(node.nodeId);
       }
     }
   }
@@ -260,7 +260,7 @@ export default class RaftNode {
   private async replicateLogsToFollower(nodeId: number) {
     if (this.state !== "leader") return;
 
-    const node = this.clusterTopology.find((n) => n.node === nodeId);
+    const node = this.clusterTopology.find((n) => n.nodeId === nodeId);
     if (!node) return;
 
     const prevLogIndex = this.nextIndex[nodeId] - 1;
@@ -353,7 +353,7 @@ export default class RaftNode {
       let matchCount = 1; // Count self
 
       for (const node of this.clusterTopology) {
-        if (node.node !== this.nodeId && this.matchIndex[node.node] >= n) {
+        if (node.nodeId !== this.nodeId && this.matchIndex[node.nodeId] >= n) {
           matchCount++;
         }
       }
@@ -645,8 +645,9 @@ export default class RaftNode {
         success: false,
         error: "not the leader",
         leader:
-          this.clusterTopology.find((node) => node.node === this.getLeaderId())
-            ?.port || null,
+          this.clusterTopology.find(
+            (node) => node.nodeId === this.getLeaderId()
+          )?.port || null,
       };
     }
 
@@ -689,8 +690,46 @@ export default class RaftNode {
   public requestListener: http.RequestListener = async (req, res) => {
     const { method, url } = req;
 
+    console.log(`Received ${method} request for ${url}`);
+
+    // Status endpoint - explicitly allow GET
+    if (url === "/status") {
+      if (method === "GET") {
+        try {
+          // Return node status
+          const status = {
+            nodeId: this.nodeId,
+            state: this.state,
+            currentTerm: this.currentTerm,
+            votedFor: this.votedFor,
+            logLength: this.log.length,
+            commitIndex: this.commitIndex,
+            lastApplied: this.lastApplied,
+            leader: this.getLeaderId(),
+          };
+
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/json");
+          res.write(JSON.stringify(status));
+          res.end();
+          return;
+        } catch (error) {
+          logger.error({
+            msg: `error handling status request`,
+            error,
+          });
+
+          res.statusCode = 500;
+          res.end("Internal Server Error");
+          return;
+        }
+      }
+    }
+
+    // For all other endpoints, require POST
     if (method !== "POST") {
       res.statusCode = 405;
+      res.setHeader("Allow", "POST");
       res.end("Method Not Allowed");
       return;
     }
@@ -749,23 +788,6 @@ export default class RaftNode {
         res.statusCode = response.success ? 200 : 500;
         res.setHeader("Content-Type", "application/json");
         res.write(JSON.stringify(response));
-        res.end();
-      } else if (url === "/status") {
-        // A debug endpoint to get the node's state
-        const status = {
-          nodeId: this.nodeId,
-          state: this.state,
-          currentTerm: this.currentTerm,
-          votedFor: this.votedFor,
-          logLength: this.log.length,
-          commitIndex: this.commitIndex,
-          lastApplied: this.lastApplied,
-          leader: this.getLeaderId(),
-        };
-
-        res.statusCode = 200;
-        res.setHeader("Content-Type", "application/json");
-        res.write(JSON.stringify(status));
         res.end();
       } else {
         res.statusCode = 404;

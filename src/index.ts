@@ -34,7 +34,7 @@ if (args._.includes("start")) {
     `Starting node ${args.node} on port ${args.port} with cluster ${args.cluster}`
   );
   const cluster = JSON.parse(args.cluster as string) as {
-    node: number;
+    nodeId: number;
     port: number;
   }[];
   const raftClient = new RaftNode(
